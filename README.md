@@ -52,11 +52,29 @@ cleanup controls at their defaults for identical behaviour, then dial them in:
 | `max_rank` | 0 (off) | Hard cap on each layer's rank after the energy cut. |
 | `tame_layers` | 0.0 (off) | Compress layers whose update is much stronger than the rest (above the LoRA's 90th percentile) back toward the pack. `0` = off, `1` = fully clamped. Try **0.5** for crunchy edges. |
 | `star_rescale` | off | [STAR](https://arxiv.org/abs/2502.10339): after `keep_energy` trims a layer, boost the kept components so the layer's total strength (nuclear norm) matches the original. Lets you trim harder without weakening the LoRA's effect. Only active when `keep_energy` < 100. |
+| `gate_strength` | 1.0 (off) | Scales the LoRA's effect on **gate layers only** (see below). `1` = unchanged, `0` = leave gates alone. Try **0.5** when stacked LoRAs deform / fight each other. No effect on LoRAs without gate layers. |
+
+### Gate layers (Krea 2 & other gated models)
+
+Modern DiTs like **Krea 2** use *gated* attention and SwiGLU MLPs — every block has
+`attn.gate` and `mlp.gate` projections (about **25% of a Krea 2 LoRA's layers**). These
+gates are *multiplicative sigmoid controls*: a small LoRA edit to a gate has an outsized,
+nonlinear effect, and when you stack LoRAs their gate edits **compound instead of
+averaging** — a major cause of blocky artifacts and of two similar LoRAs fighting into
+deformities / anatomy errors.
+
+Crucially this is invisible to `tame_layers`, because gates tend to be *modest* in norm
+while punching far above it. `gate_strength` targets them **by name** instead: set it below
+1 to soften how much a LoRA perturbs the gates while leaving the content layers (Q/K/V/O,
+MLP up/down) at full strength. Start at **0.5** for the fighting-LoRAs case.
 
 ### Suggested starting point
 For a style LoRA that's adding artifacts on a turbo model:
 `keep_energy = 95`, `tame_layers = 0.5`. Compare against stock loading and back off if the
 LoRA's effect gets too weak. When stacking multiple LoRAs, clean each one individually.
+
+For **stacked LoRAs on Krea 2 fighting each other**, reach for `gate_strength = 0.5` first —
+it targets the exact mechanism (compounding gate edits) that the other controls can't.
 
 If trimming visibly weakens the LoRA, turn on `star_rescale` — it restores each trimmed
 layer's strength, so you can push `keep_energy` down to 90 or below while keeping the
@@ -98,6 +116,10 @@ types, matching the safety rules used by the drop-in loader.
   [STAR: Spectral Truncation and Rescale](https://arxiv.org/abs/2502.10339) (Lee et al.,
   2025): after truncation, the kept singular values are scaled by the ratio of original to
   kept nuclear norm, so removing the conflict-prone tail doesn't shrink the update.
+- **Gate scaling** identifies gate-projection layers by key name (any path segment
+  containing `gate` — e.g. `attn.gate`, `mlp.gate`, `gate_proj`) and multiplies just those
+  layers' updates by `gate_strength`. Independent of the norm math, so it catches gates
+  that `tame_layers` can't. Non-gate layers are left byte-identical.
 - The transformed state dict is then handed to ComfyUI's own `load_lora_for_models`, so
   application is 100% standard.
 

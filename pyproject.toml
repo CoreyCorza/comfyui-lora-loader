@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-lora-loader"
 description = "A drop-in ComfyUI LoRA loader with optional spectral cleanup (energy trimming + hot-layer taming) to reduce artifacts from stacked LoRAs and turbo/distilled models."
-version = "1.1.0"
+version = "1.2.0"
 license = { text = "MIT" }
 readme = "README.md"
 requires-python = ">=3.9"

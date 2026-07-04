@@ -129,8 +129,15 @@ def _rebuild(f, k, gain, up, down):
     return new_up.to(up.dtype).contiguous(), new_down.to(down.dtype).contiguous()
 
 
+def _is_gate(prefix):
+    """True for multiplicative gate projections (gated attention output gate,
+    SwiGLU MLP gate, etc.) — e.g. Krea 2's blocks.N.attn.gate / blocks.N.mlp.gate,
+    or generic gate_proj / to_gate names."""
+    return any("gate" in seg.lower() for seg in prefix.split("."))
+
+
 @torch.no_grad()
-def _clean_lora(sd, keep_energy, max_rank, tame_layers, star_rescale, lora_name):
+def _clean_lora(sd, keep_energy, max_rank, tame_layers, star_rescale, gate_strength, lora_name):
     pairs = _find_pairs(sd)
     if not pairs:
         logging.info(f"[Corza LoRA] {lora_name}: no cleanable up/down pairs found, loading as-is")
@@ -152,10 +159,18 @@ def _clean_lora(sd, keep_energy, max_rank, tame_layers, star_rescale, lora_name)
             nuc_kept = float(f["s"][:k].sum())
             if nuc_kept > 0.0:
                 gain = nuc_all / nuc_kept
+        # Gate scaling: gates are multiplicative sigmoid controls, so a LoRA delta
+        # there has outsized nonlinear effect (and stacked LoRAs' gate edits compound
+        # rather than average) — a common artifact / "loras fighting" source that
+        # norm-based taming misses. Scale their update down by gate_strength.
+        is_gate = _is_gate(prefix)
+        if is_gate:
+            gain *= gate_strength
         norm = float(torch.sqrt((f["s"][:k] ** 2).sum())) * gain
         facts.append({"up_key": up_key, "down_key": down_key, "alpha_key": alpha_key,
                       "prefix": prefix, "f": f, "k": k, "norm": norm, "gain": gain,
-                      "star": gain if gain != 1.0 else None})
+                      "star": (gain if star_rescale and k < f["s"].shape[0] else None),
+                      "is_gate": is_gate})
 
     # Pass 2: tame outlier layers — compress norms above the 90th percentile
     # back toward it. tame_layers interpolates between untouched (0) and fully
@@ -170,22 +185,27 @@ def _clean_lora(sd, keep_energy, max_rank, tame_layers, star_rescale, lora_name)
                     x["gain"] *= target / x["norm"]
                     x["tamed"] = True
 
-    # Pass 3: rebuild the state dict.
+    # Pass 3: rebuild the state dict (leaving genuinely-untouched layers as-is).
     out = dict(sd)
-    rank_in, rank_out, tamed = 0, 0, 0
+    rank_in, rank_out, tamed, gated = 0, 0, 0, 0
     for x in facts:
         up, down = sd[x["up_key"]], sd[x["down_key"]]
-        gain = x["gain"]
-        new_up, new_down = _rebuild(x["f"], x["k"], gain, up, down)
+        rank_in += down.shape[0]
+        # nothing to do: full rank kept and no gain change → leave original tensors
+        if x["k"] == down.shape[0] and abs(x["gain"] - 1.0) < 1e-9:
+            rank_out += x["k"]
+            continue
+        new_up, new_down = _rebuild(x["f"], x["k"], x["gain"], up, down)
         out[x["up_key"]] = new_up
         out[x["down_key"]] = new_down
         if x["alpha_key"] is not None:
             # scale is baked into the factors → make alpha/rank come out as 1
             out[x["alpha_key"]] = torch.tensor(float(x["k"]))
-        rank_in += down.shape[0]
         rank_out += x["k"]
         if x.get("tamed"):
             tamed += 1
+        if x["is_gate"] and gate_strength != 1.0:
+            gated += 1
 
     hottest = sorted(facts, key=lambda x: x["norm"], reverse=True)[:5]
     hot_txt = ", ".join(f"{x['prefix'].split('.')[-1] or x['prefix']}={x['norm']:.3f}" for x in hottest)
@@ -194,9 +214,15 @@ def _clean_lora(sd, keep_energy, max_rank, tame_layers, star_rescale, lora_name)
         gains = [x["star"] for x in facts if x["star"] is not None]
         if gains:
             star_txt = f", STAR-rescaled {len(gains)} layers (avg x{sum(gains) / len(gains):.2f})"
+    gate_txt = ""
+    n_gate = sum(1 for x in facts if x["is_gate"])
+    if n_gate:
+        gate_txt = f", {n_gate} gate layers"
+        if gate_strength != 1.0:
+            gate_txt += f" scaled x{gate_strength:.2f}"
     logging.info(
         f"[Corza LoRA] {lora_name}: cleaned {len(facts)} layers, "
-        f"total rank {rank_in} -> {rank_out}, tamed {tamed} hot layers{star_txt} | hottest: {hot_txt}"
+        f"total rank {rank_in} -> {rank_out}, tamed {tamed} hot layers{star_txt}{gate_txt} | hottest: {hot_txt}"
     )
     return out
 
@@ -229,7 +255,7 @@ def _cleanable_lora_adapter(adapter):
 
 
 @torch.no_grad()
-def _clean_model_lora_patches(model, keep_energy, max_rank, tame_layers, star_rescale):
+def _clean_model_lora_patches(model, keep_energy, max_rank, tame_layers, star_rescale, gate_strength):
     facts = []
     for patch_key, patch_list in getattr(model, "patches", {}).items():
         for patch_index, patch in enumerate(patch_list):
@@ -249,6 +275,10 @@ def _clean_model_lora_patches(model, keep_energy, max_rank, tame_layers, star_re
                 nuc_kept = float(f["s"][:k].sum())
                 if nuc_kept > 0.0:
                     gain = nuc_all / nuc_kept
+            # gates: multiplicative sigmoid controls, outsized/compounding effect
+            is_gate = _is_gate(patch_key)
+            if is_gate:
+                gain *= gate_strength
             norm = float(torch.sqrt((f["s"][:k] ** 2).sum())) * gain
             facts.append({
                 "patch_key": patch_key,
@@ -261,7 +291,8 @@ def _clean_model_lora_patches(model, keep_energy, max_rank, tame_layers, star_re
                 "k": k,
                 "norm": norm,
                 "gain": gain,
-                "star": gain if gain != 1.0 else None,
+                "star": (gain if star_rescale and k < f["s"].shape[0] else None),
+                "is_gate": is_gate,
             })
 
     if not facts:
@@ -281,6 +312,11 @@ def _clean_model_lora_patches(model, keep_energy, max_rank, tame_layers, star_re
     out_model = model.clone()
     rank_in, rank_out, tamed = 0, 0, 0
     for x in facts:
+        rank_in += x["down"].shape[0]
+        rank_out += x["k"]
+        # untouched (full rank, no gain change) → leave the original patch as-is
+        if x["k"] == x["down"].shape[0] and abs(x["gain"] - 1.0) < 1e-9:
+            continue
         new_up, new_down = _rebuild(x["f"], x["k"], x["gain"], x["up"], x["down"])
         new_alpha = float(x["k"]) if x["alpha"] is not None else None
         new_weights = (new_up, new_down, new_alpha, None, None, None)
@@ -291,8 +327,6 @@ def _clean_model_lora_patches(model, keep_energy, max_rank, tame_layers, star_re
         patch = patch_list[x["patch_index"]]
         patch_list[x["patch_index"]] = (patch[0], new_adapter, *patch[2:])
 
-        rank_in += x["down"].shape[0]
-        rank_out += x["k"]
         if x.get("tamed"):
             tamed += 1
 
@@ -304,9 +338,15 @@ def _clean_model_lora_patches(model, keep_energy, max_rank, tame_layers, star_re
         gains = [x["star"] for x in facts if x["star"] is not None]
         if gains:
             star_txt = f", STAR-rescaled {len(gains)} patches (avg x{sum(gains) / len(gains):.2f})"
+    gate_txt = ""
+    n_gate = sum(1 for x in facts if x["is_gate"])
+    if n_gate:
+        gate_txt = f", {n_gate} gate patches"
+        if gate_strength != 1.0:
+            gate_txt += f" scaled x{gate_strength:.2f}"
     logging.info(
         f"[Corza LoRA] applied patch cleaner: cleaned {len(facts)} patches, "
-        f"total rank {rank_in} -> {rank_out}, tamed {tamed} hot patches{star_txt} | hottest: {hot_txt}"
+        f"total rank {rank_in} -> {rank_out}, tamed {tamed} hot patches{star_txt}{gate_txt} | hottest: {hot_txt}"
     )
     return out_model
 
@@ -352,6 +392,16 @@ class CorzaLoRAClean(io.ComfyNode):
                             "original — trims the conflict-prone tail without weakening the "
                             "LoRA. Only does something when keep_energy < 100.",
                 ),
+                io.Float.Input(
+                    "gate_strength", default=1.0, min=0.0, max=1.0, step=0.05,
+                    tooltip="Scales the LoRA's effect on 'gate' layers only (Krea 2's gated "
+                            "attention + SwiGLU gates, etc.). Gates are multiplicative sigmoid "
+                            "controls, so LoRA edits there have outsized, compounding effect — "
+                            "a big source of artifacts and of stacked LoRAs fighting, which the "
+                            "norm-based tame_layers misses. 1 = unchanged, 0 = leave gates "
+                            "alone. Try 0.5 if stacked LoRAs deform. No effect on LoRAs without "
+                            "gate layers.",
+                ),
             ],
             outputs=[
                 io.Model.Output("model"),
@@ -370,6 +420,7 @@ class CorzaLoRAClean(io.ComfyNode):
         max_rank: int = 0,
         tame_layers: float = 0.0,
         star_rescale: bool = False,
+        gate_strength: float = 1.0,
         clip=None,
     ) -> io.NodeOutput:
         if strength_model == 0 and (clip is None or strength_clip == 0):
@@ -378,9 +429,9 @@ class CorzaLoRAClean(io.ComfyNode):
         lora_path = folder_paths.get_full_path_or_raise("loras", lora_name)
         sd = comfy.utils.load_torch_file(lora_path, safe_load=True)
 
-        cleaning = keep_energy < 100.0 or max_rank > 0 or tame_layers > 0.0
+        cleaning = keep_energy < 100.0 or max_rank > 0 or tame_layers > 0.0 or gate_strength != 1.0
         if cleaning:
-            sd = _clean_lora(sd, keep_energy, max_rank, tame_layers, star_rescale, lora_name)
+            sd = _clean_lora(sd, keep_energy, max_rank, tame_layers, star_rescale, gate_strength, lora_name)
 
         model_lora, clip_lora = comfy.sd.load_lora_for_models(
             model, clip, sd, strength_model, strength_clip
@@ -422,6 +473,15 @@ class CorzaCleanAppliedLoRAs(io.ComfyNode):
                     tooltip="STAR rescale after truncation. Only does something when "
                             "keep_energy trims a patch or max_rank caps it.",
                 ),
+                io.Float.Input(
+                    "gate_strength", default=1.0, min=0.0, max=1.0, step=0.05,
+                    tooltip="Scales the effect of applied LoRA patches on 'gate' layers only "
+                            "(Krea 2 gated-attention + SwiGLU gates, etc.). Gates are "
+                            "multiplicative sigmoid controls whose LoRA edits have outsized, "
+                            "compounding effect — a big source of artifacts and of stacked "
+                            "LoRAs fighting. 1 = unchanged, 0 = leave gates alone. Try 0.5 if "
+                            "stacked LoRAs deform.",
+                ),
             ],
             outputs=[
                 io.Model.Output("model"),
@@ -436,8 +496,9 @@ class CorzaCleanAppliedLoRAs(io.ComfyNode):
         max_rank: int = 0,
         tame_layers: float = 0.0,
         star_rescale: bool = False,
+        gate_strength: float = 1.0,
     ) -> io.NodeOutput:
-        cleaning = keep_energy < 100.0 or max_rank > 0 or tame_layers > 0.0
+        cleaning = keep_energy < 100.0 or max_rank > 0 or tame_layers > 0.0 or gate_strength != 1.0
         if not cleaning:
             return io.NodeOutput(model)
         model_lora = _clean_model_lora_patches(
@@ -446,6 +507,7 @@ class CorzaCleanAppliedLoRAs(io.ComfyNode):
             max_rank=max_rank,
             tame_layers=tame_layers,
             star_rescale=star_rescale,
+            gate_strength=gate_strength,
         )
         return io.NodeOutput(model_lora)
 
