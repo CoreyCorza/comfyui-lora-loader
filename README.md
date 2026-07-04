@@ -4,7 +4,9 @@ A drop-in ComfyUI LoRA loader to reduce artifacts you often get from stacked LoR
 distilled or turbo models (e.g. Krea‑2‑Turbo, Flux turbo etc).
 
 With cleaning turned off it behaves **exactly** like the stock *Load LoRA* node, so you
-can drop it in and A/B without changing anything else.
+can drop it in and A/B without changing anything else. The package also includes a
+model-only inline cleaner for workflows that should keep using ComfyUI's normal LoRA
+loaders.
 
 ## Why
 
@@ -29,7 +31,11 @@ applies the LoRA — so it's model‑agnostic and needs no changes downstream.
 cd ComfyUI/custom_nodes
 git clone https://github.com/CoreyCorza/comfyui-lora-loader
 ```
-Restart ComfyUI. The node appears under **`corza/lora`** as **Corza LoRA Loader (Clean)**.
+Restart ComfyUI. The nodes appear under **`corza/lora`**:
+
+- **Corza LoRA Loader (Clean)** - a drop-in replacement for the stock LoRA loader.
+- **Corza Clean Applied LoRAs** - a `MODEL -> MODEL` inline cleaner for LoRAs already
+  applied upstream.
 
 No extra dependencies — it only uses PyTorch and ComfyUI's own LoRA code.
 
@@ -58,6 +64,26 @@ LoRA's full effect.
 
 It logs a short report to the ComfyUI console per LoRA (rank saved, hottest layers) so you
 can see what each one is doing.
+
+### Inline model-path cleaner
+
+Use **Corza Clean Applied LoRAs** when you want to keep the normal ComfyUI LoRA loaders.
+Place it after the LoRA loaders you want cleaned:
+
+`MODEL -> Load LoRA -> Load LoRA -> Corza Clean Applied LoRAs -> sampler`
+
+The node only sees LoRA patches already present on its input `MODEL`, so downstream LoRA
+loaders are ignored naturally:
+
+`MODEL -> Load LoRA A -> Corza Clean Applied LoRAs -> Load LoRA B -> sampler`
+
+In that graph, LoRA A is cleaned and LoRA B is not. This node is model-only, which fits
+modern model families such as Krea 2 where the LoRA is applied to the diffusion model path
+rather than CLIP.
+
+The inline cleaner supports standard ComfyUI LoRA adapter patches. It deliberately skips
+patches with DoRA scale, LoCon/Tucker mid weights, reshape metadata, or unknown adapter
+types, matching the safety rules used by the drop-in loader.
 
 ## How it works
 
