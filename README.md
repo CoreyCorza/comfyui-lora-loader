@@ -1,13 +1,10 @@
 # Corza LoRA Loader (Clean)
 
-A drop-in ComfyUI LoRA loader that can **clean up the LoRA at load time** to reduce
-the blocky / crunchy / fuzzy-edge artifacts you often get from stacked LoRAs and from
-distilled or turbo models (e.g. Krea‑2‑Turbo, Flux turbo variants).
+A drop-in ComfyUI LoRA loader to reduce artifacts you often get from stacked LoRAs and from
+distilled or turbo models (e.g. Krea‑2‑Turbo, Flux turbo etc).
 
 With cleaning turned off it behaves **exactly** like the stock *Load LoRA* node, so you
 can drop it in and A/B without changing anything else.
-
-![node](https://raw.githubusercontent.com/CoreyCorza/comfyui-lora-loader/main/.github/node.png)
 
 ## Why
 
