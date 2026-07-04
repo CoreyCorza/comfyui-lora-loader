@@ -394,13 +394,13 @@ class CorzaLoRAClean(io.ComfyNode):
                 ),
                 io.Float.Input(
                     "gate_strength", default=1.0, min=0.0, max=1.0, step=0.05,
-                    tooltip="Scales the LoRA's effect on 'gate' layers only (Krea 2's gated "
-                            "attention + SwiGLU gates, etc.). Gates are multiplicative sigmoid "
-                            "controls, so LoRA edits there have outsized, compounding effect — "
-                            "a big source of artifacts and of stacked LoRAs fighting, which the "
-                            "norm-based tame_layers misses. 1 = unchanged, 0 = leave gates "
-                            "alone. Try 0.5 if stacked LoRAs deform. No effect on LoRAs without "
-                            "gate layers.",
+                    tooltip="How much of the LoRA's effect reaches 'gate' layers only (Krea 2's "
+                            "gated attention + SwiGLU gates, etc.). Gates are multiplicative "
+                            "sigmoid controls, so LoRA edits there have outsized, compounding "
+                            "effect — a big source of artifacts and of stacked LoRAs fighting, "
+                            "which the norm-based tame_layers misses. 1 = full effect (default), "
+                            "0 = strip the LoRA from gates (they stay at base). Try 0.5 if "
+                            "stacked LoRAs deform. No effect on LoRAs without gate layers.",
                 ),
             ],
             outputs=[
@@ -475,12 +475,12 @@ class CorzaCleanAppliedLoRAs(io.ComfyNode):
                 ),
                 io.Float.Input(
                     "gate_strength", default=1.0, min=0.0, max=1.0, step=0.05,
-                    tooltip="Scales the effect of applied LoRA patches on 'gate' layers only "
-                            "(Krea 2 gated-attention + SwiGLU gates, etc.). Gates are "
+                    tooltip="How much of the applied LoRA patches' effect reaches 'gate' layers "
+                            "only (Krea 2 gated-attention + SwiGLU gates, etc.). Gates are "
                             "multiplicative sigmoid controls whose LoRA edits have outsized, "
                             "compounding effect — a big source of artifacts and of stacked "
-                            "LoRAs fighting. 1 = unchanged, 0 = leave gates alone. Try 0.5 if "
-                            "stacked LoRAs deform.",
+                            "LoRAs fighting. 1 = full effect (default), 0 = strip the LoRA from "
+                            "gates (they stay at base). Try 0.5 if stacked LoRAs deform.",
                 ),
             ],
             outputs=[

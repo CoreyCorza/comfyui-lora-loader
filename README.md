@@ -52,7 +52,7 @@ cleanup controls at their defaults for identical behaviour, then dial them in:
 | `max_rank` | 0 (off) | Hard cap on each layer's rank after the energy cut. |
 | `tame_layers` | 0.0 (off) | Compress layers whose update is much stronger than the rest (above the LoRA's 90th percentile) back toward the pack. `0` = off, `1` = fully clamped. Try **0.5** for crunchy edges. |
 | `star_rescale` | off | [STAR](https://arxiv.org/abs/2502.10339): after `keep_energy` trims a layer, boost the kept components so the layer's total strength (nuclear norm) matches the original. Lets you trim harder without weakening the LoRA's effect. Only active when `keep_energy` < 100. |
-| `gate_strength` | 1.0 (off) | Scales the LoRA's effect on **gate layers only** (see below). `1` = unchanged, `0` = leave gates alone. Try **0.5** when stacked LoRAs deform / fight each other. No effect on LoRAs without gate layers. |
+| `gate_strength` | 1.0 (off) | How much of the LoRA's effect reaches **gate layers only** (see below). `1` = full effect (default), `0` = strip the LoRA from gates entirely (they stay at base). Try **0.5** when stacked LoRAs deform / fight each other. No effect on LoRAs without gate layers. |
 
 ### Gate layers (Krea 2 & other gated models)
 
