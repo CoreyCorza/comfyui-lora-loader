@@ -45,11 +45,16 @@ cleanup controls at their defaults for identical behaviour, then dial them in:
 | `keep_energy` | 100 (off) | Per layer, keep only the strongest SVD components summing to this % of the update's energy; drop the rest as noise. Try **95**, then **90** if artifacts persist. |
 | `max_rank` | 0 (off) | Hard cap on each layer's rank after the energy cut. |
 | `tame_layers` | 0.0 (off) | Compress layers whose update is much stronger than the rest (above the LoRA's 90th percentile) back toward the pack. `0` = off, `1` = fully clamped. Try **0.5** for crunchy edges. |
+| `star_rescale` | off | [STAR](https://arxiv.org/abs/2502.10339): after `keep_energy` trims a layer, boost the kept components so the layer's total strength (nuclear norm) matches the original. Lets you trim harder without weakening the LoRA's effect. Only active when `keep_energy` < 100. |
 
 ### Suggested starting point
 For a style LoRA that's adding artifacts on a turbo model:
 `keep_energy = 95`, `tame_layers = 0.5`. Compare against stock loading and back off if the
 LoRA's effect gets too weak. When stacking multiple LoRAs, clean each one individually.
+
+If trimming visibly weakens the LoRA, turn on `star_rescale` — it restores each trimmed
+layer's strength, so you can push `keep_energy` down to 90 or below while keeping the
+LoRA's full effect.
 
 It logs a short report to the ComfyUI console per LoRA (rank saved, hottest layers) so you
 can see what each one is doing.
@@ -63,6 +68,10 @@ can see what each one is doing.
   rank with the scale baked in.
 - **Taming** measures each layer's Frobenius norm, finds the 90th percentile across the
   LoRA, and scales down any layer above it toward that percentile by `tame_layers`.
+- **STAR rescale** implements the rescale step from
+  [STAR: Spectral Truncation and Rescale](https://arxiv.org/abs/2502.10339) (Lee et al.,
+  2025): after truncation, the kept singular values are scaled by the ratio of original to
+  kept nuclear norm, so removing the conflict-prone tail doesn't shrink the update.
 - The transformed state dict is then handed to ComfyUI's own `load_lora_for_models`, so
   application is 100% standard.
 

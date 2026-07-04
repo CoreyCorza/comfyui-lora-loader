@@ -129,7 +129,7 @@ def _rebuild(f, k, gain, up, down):
 
 
 @torch.no_grad()
-def _clean_lora(sd, keep_energy, max_rank, tame_layers, lora_name):
+def _clean_lora(sd, keep_energy, max_rank, tame_layers, star_rescale, lora_name):
     pairs = _find_pairs(sd)
     if not pairs:
         logging.info(f"[Corza LoRA] {lora_name}: no cleanable up/down pairs found, loading as-is")
@@ -142,13 +142,23 @@ def _clean_lora(sd, keep_energy, max_rank, tame_layers, lora_name):
         alpha = sd[alpha_key].item() if alpha_key is not None else None
         f = _factorize(up, down, alpha)
         k = _pick_rank(f["s"], keep_energy, max_rank)
-        norm = float(torch.sqrt((f["s"][:k] ** 2).sum()))
+        # STAR rescale (arXiv:2502.10339): after truncating, boost the kept
+        # components so the layer's nuclear norm matches the original — trimming
+        # removes the conflict-prone tail without weakening the LoRA's effect.
+        gain = 1.0
+        if star_rescale and k < f["s"].shape[0]:
+            nuc_all = float(f["s"].sum())
+            nuc_kept = float(f["s"][:k].sum())
+            if nuc_kept > 0.0:
+                gain = nuc_all / nuc_kept
+        norm = float(torch.sqrt((f["s"][:k] ** 2).sum())) * gain
         facts.append({"up_key": up_key, "down_key": down_key, "alpha_key": alpha_key,
-                      "prefix": prefix, "f": f, "k": k, "norm": norm})
+                      "prefix": prefix, "f": f, "k": k, "norm": norm, "gain": gain,
+                      "star": gain if gain != 1.0 else None})
 
     # Pass 2: tame outlier layers — compress norms above the 90th percentile
     # back toward it. tame_layers interpolates between untouched (0) and fully
-    # clamped to the percentile (1).
+    # clamped to the percentile (1). Runs on post-rescale norms.
     if tame_layers > 0.0 and len(facts) >= 4:
         norms = torch.tensor([x["norm"] for x in facts])
         q = float(torch.quantile(norms, 0.90))
@@ -156,14 +166,15 @@ def _clean_lora(sd, keep_energy, max_rank, tame_layers, lora_name):
             for x in facts:
                 if x["norm"] > q:
                     target = q + (x["norm"] - q) * (1.0 - tame_layers)
-                    x["gain"] = target / x["norm"]
+                    x["gain"] *= target / x["norm"]
+                    x["tamed"] = True
 
     # Pass 3: rebuild the state dict.
     out = dict(sd)
     rank_in, rank_out, tamed = 0, 0, 0
     for x in facts:
         up, down = sd[x["up_key"]], sd[x["down_key"]]
-        gain = x.get("gain", 1.0)
+        gain = x["gain"]
         new_up, new_down = _rebuild(x["f"], x["k"], gain, up, down)
         out[x["up_key"]] = new_up
         out[x["down_key"]] = new_down
@@ -172,14 +183,19 @@ def _clean_lora(sd, keep_energy, max_rank, tame_layers, lora_name):
             out[x["alpha_key"]] = torch.tensor(float(x["k"]))
         rank_in += down.shape[0]
         rank_out += x["k"]
-        if gain != 1.0:
+        if x.get("tamed"):
             tamed += 1
 
     hottest = sorted(facts, key=lambda x: x["norm"], reverse=True)[:5]
     hot_txt = ", ".join(f"{x['prefix'].split('.')[-1] or x['prefix']}={x['norm']:.3f}" for x in hottest)
+    star_txt = ""
+    if star_rescale:
+        gains = [x["star"] for x in facts if x["star"] is not None]
+        if gains:
+            star_txt = f", STAR-rescaled {len(gains)} layers (avg x{sum(gains) / len(gains):.2f})"
     logging.info(
         f"[Corza LoRA] {lora_name}: cleaned {len(facts)} layers, "
-        f"total rank {rank_in} -> {rank_out}, tamed {tamed} hot layers | hottest: {hot_txt}"
+        f"total rank {rank_in} -> {rank_out}, tamed {tamed} hot layers{star_txt} | hottest: {hot_txt}"
     )
     return out
 
@@ -218,6 +234,13 @@ class CorzaLoRAClean(io.ComfyNode):
                             "(above the LoRA's 90th percentile) back toward the pack. "
                             "0 = off, 1 = fully clamped. Try 0.5 for crunchy edges.",
                 ),
+                io.Boolean.Input(
+                    "star_rescale", default=False,
+                    tooltip="STAR (arXiv:2502.10339): after keep_energy trims a layer, boost "
+                            "the kept components so the layer's total strength matches the "
+                            "original — trims the conflict-prone tail without weakening the "
+                            "LoRA. Only does something when keep_energy < 100.",
+                ),
             ],
             outputs=[
                 io.Model.Output("model"),
@@ -235,6 +258,7 @@ class CorzaLoRAClean(io.ComfyNode):
         keep_energy: float = 100.0,
         max_rank: int = 0,
         tame_layers: float = 0.0,
+        star_rescale: bool = False,
         clip=None,
     ) -> io.NodeOutput:
         if strength_model == 0 and (clip is None or strength_clip == 0):
@@ -245,7 +269,7 @@ class CorzaLoRAClean(io.ComfyNode):
 
         cleaning = keep_energy < 100.0 or max_rank > 0 or tame_layers > 0.0
         if cleaning:
-            sd = _clean_lora(sd, keep_energy, max_rank, tame_layers, lora_name)
+            sd = _clean_lora(sd, keep_energy, max_rank, tame_layers, star_rescale, lora_name)
 
         model_lora, clip_lora = comfy.sd.load_lora_for_models(
             model, clip, sd, strength_model, strength_clip
