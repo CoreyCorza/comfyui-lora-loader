@@ -28,6 +28,7 @@ it cleans one LoRA well instead of merging many.
 """
 
 import logging
+import uuid
 
 import torch
 
@@ -200,6 +201,116 @@ def _clean_lora(sd, keep_energy, max_rank, tame_layers, star_rescale, lora_name)
     return out
 
 
+def _adapter_alpha_value(alpha):
+    if alpha is None:
+        return None
+    if hasattr(alpha, "item"):
+        return alpha.item()
+    return alpha
+
+
+def _cleanable_lora_adapter(adapter):
+    if getattr(adapter, "name", None) != "lora":
+        return None
+    weights = getattr(adapter, "weights", None)
+    if not isinstance(weights, (list, tuple)) or len(weights) < 6:
+        return None
+
+    up, down, alpha, mid, dora_scale, reshape = weights[:6]
+    if mid is not None or dora_scale is not None or reshape is not None:
+        return None
+    if not torch.is_tensor(up) or not torch.is_tensor(down):
+        return None
+    if up.ndim < 2 or down.ndim < 2:
+        return None
+    if any(d != 1 for d in up.shape[2:]):
+        return None
+    return up, down, _adapter_alpha_value(alpha)
+
+
+@torch.no_grad()
+def _clean_model_lora_patches(model, keep_energy, max_rank, tame_layers, star_rescale):
+    facts = []
+    for patch_key, patch_list in getattr(model, "patches", {}).items():
+        for patch_index, patch in enumerate(patch_list):
+            if len(patch) < 2:
+                continue
+            adapter = patch[1]
+            cleanable = _cleanable_lora_adapter(adapter)
+            if cleanable is None:
+                continue
+
+            up, down, alpha = cleanable
+            f = _factorize(up, down, alpha)
+            k = _pick_rank(f["s"], keep_energy, max_rank)
+            gain = 1.0
+            if star_rescale and k < f["s"].shape[0]:
+                nuc_all = float(f["s"].sum())
+                nuc_kept = float(f["s"][:k].sum())
+                if nuc_kept > 0.0:
+                    gain = nuc_all / nuc_kept
+            norm = float(torch.sqrt((f["s"][:k] ** 2).sum())) * gain
+            facts.append({
+                "patch_key": patch_key,
+                "patch_index": patch_index,
+                "adapter": adapter,
+                "up": up,
+                "down": down,
+                "alpha": alpha,
+                "f": f,
+                "k": k,
+                "norm": norm,
+                "gain": gain,
+                "star": gain if gain != 1.0 else None,
+            })
+
+    if not facts:
+        logging.info("[Corza LoRA] applied patch cleaner: no cleanable LoRA patches found")
+        return model
+
+    if tame_layers > 0.0 and len(facts) >= 4:
+        norms = torch.tensor([x["norm"] for x in facts])
+        q = float(torch.quantile(norms, 0.90))
+        if q > 0.0:
+            for x in facts:
+                if x["norm"] > q:
+                    target = q + (x["norm"] - q) * (1.0 - tame_layers)
+                    x["gain"] *= target / x["norm"]
+                    x["tamed"] = True
+
+    out_model = model.clone()
+    rank_in, rank_out, tamed = 0, 0, 0
+    for x in facts:
+        new_up, new_down = _rebuild(x["f"], x["k"], x["gain"], x["up"], x["down"])
+        new_alpha = float(x["k"]) if x["alpha"] is not None else None
+        new_weights = (new_up, new_down, new_alpha, None, None, None)
+        loaded_keys = getattr(x["adapter"], "loaded_keys", set())
+        new_adapter = type(x["adapter"])(loaded_keys, new_weights)
+
+        patch_list = out_model.patches[x["patch_key"]]
+        patch = patch_list[x["patch_index"]]
+        patch_list[x["patch_index"]] = (patch[0], new_adapter, *patch[2:])
+
+        rank_in += x["down"].shape[0]
+        rank_out += x["k"]
+        if x.get("tamed"):
+            tamed += 1
+
+    out_model.patches_uuid = uuid.uuid4()
+    hottest = sorted(facts, key=lambda x: x["norm"], reverse=True)[:5]
+    hot_txt = ", ".join(f"{x['patch_key']}[{x['patch_index']}]={x['norm']:.3f}" for x in hottest)
+    star_txt = ""
+    if star_rescale:
+        gains = [x["star"] for x in facts if x["star"] is not None]
+        if gains:
+            star_txt = f", STAR-rescaled {len(gains)} patches (avg x{sum(gains) / len(gains):.2f})"
+    logging.info(
+        f"[Corza LoRA] applied patch cleaner: cleaned {len(facts)} patches, "
+        f"total rank {rank_in} -> {rank_out}, tamed {tamed} hot patches{star_txt} | hottest: {hot_txt}"
+    )
+    return out_model
+
+
 class CorzaLoRAClean(io.ComfyNode):
     @classmethod
     def define_schema(cls) -> io.Schema:
@@ -277,10 +388,74 @@ class CorzaLoRAClean(io.ComfyNode):
         return io.NodeOutput(model_lora, clip_lora)
 
 
+class CorzaCleanAppliedLoRAs(io.ComfyNode):
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="CorzaCleanAppliedLoRAs",
+            display_name="Corza Clean Applied LoRAs",
+            category="corza/lora",
+            description="Cleans standard LoRA patches already applied to the incoming "
+                        "MODEL. Place it after upstream LoRA loaders; downstream LoRA "
+                        "loaders remain untouched.",
+            inputs=[
+                io.Model.Input("model"),
+                io.Float.Input(
+                    "keep_energy", default=100.0, min=50.0, max=100.0, step=0.5,
+                    tooltip="Per applied LoRA patch, keep only the strongest SVD "
+                            "components adding up to this % of the update's energy. "
+                            "100 = off.",
+                ),
+                io.Int.Input(
+                    "max_rank", default=0, min=0, max=1024,
+                    tooltip="Hard cap on each applied LoRA patch's rank after the "
+                            "energy cut. 0 = off.",
+                ),
+                io.Float.Input(
+                    "tame_layers", default=0.0, min=0.0, max=1.0, step=0.05,
+                    tooltip="Compress applied LoRA patches whose update is much "
+                            "stronger than the rest of the upstream LoRA stack. "
+                            "0 = off, 1 = fully clamped.",
+                ),
+                io.Boolean.Input(
+                    "star_rescale", default=False,
+                    tooltip="STAR rescale after truncation. Only does something when "
+                            "keep_energy trims a patch or max_rank caps it.",
+                ),
+            ],
+            outputs=[
+                io.Model.Output("model"),
+            ],
+        )
+
+    @classmethod
+    def execute(
+        cls,
+        model,
+        keep_energy: float = 100.0,
+        max_rank: int = 0,
+        tame_layers: float = 0.0,
+        star_rescale: bool = False,
+    ) -> io.NodeOutput:
+        cleaning = keep_energy < 100.0 or max_rank > 0 or tame_layers > 0.0
+        if not cleaning:
+            return io.NodeOutput(model)
+        model_lora = _clean_model_lora_patches(
+            model,
+            keep_energy=keep_energy,
+            max_rank=max_rank,
+            tame_layers=tame_layers,
+            star_rescale=star_rescale,
+        )
+        return io.NodeOutput(model_lora)
+
+
 NODE_CLASS_MAPPINGS = {
     "CorzaLoRAClean": CorzaLoRAClean,
+    "CorzaCleanAppliedLoRAs": CorzaCleanAppliedLoRAs,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "CorzaLoRAClean": "Corza LoRA Loader (Clean)",
+    "CorzaCleanAppliedLoRAs": "Corza Clean Applied LoRAs",
 }
