@@ -1,0 +1,18 @@
+[project]
+name = "comfyui-lora-loader"
+description = "A drop-in ComfyUI LoRA loader with optional spectral cleanup (energy trimming + hot-layer taming) to reduce artifacts from stacked LoRAs and turbo/distilled models."
+version = "1.0.0"
+license = { text = "MIT" }
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/CoreyCorza/comfyui-lora-loader"
+
+# ComfyUI Registry metadata (https://docs.comfy.org/registry/overview).
+# Set PublisherId to your registry publisher handle before `comfy node publish`.
+[tool.comfy]
+PublisherId = ""
+DisplayName = "Corza LoRA Loader (Clean)"
+Repository = "https://github.com/CoreyCorza/comfyui-lora-loader"
